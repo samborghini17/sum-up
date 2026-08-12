@@ -2,19 +2,15 @@ import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:desktop_drop/desktop_drop.dart';
 import 'dart:async';
 import '../services/pdf_export_service.dart';
-
-class VideoChapter {
-  final String title;
-  final Duration time;
-  final String priority; // 'high', 'medium', 'low'
-
-  VideoChapter(this.title, this.time, this.priority);
-}
+import '../services/gemini_service.dart';
+import '../services/settings_service.dart';
 
 class AnalyzerScreen extends StatefulWidget {
-  const AnalyzerScreen({super.key});
+  final SettingsService settingsService;
+  const AnalyzerScreen({super.key, required this.settingsService});
 
   @override
   State<AnalyzerScreen> createState() => _AnalyzerScreenState();
@@ -24,26 +20,28 @@ class _AnalyzerScreenState extends State<AnalyzerScreen> with SingleTickerProvid
   late TabController _tabController;
   late final player = Player();
   late final controller = VideoController(player);
+  
   String? _videoPath;
   String? _videoName;
   Duration _videoDuration = Duration.zero;
   Duration _currentPosition = Duration.zero;
+  bool _isDragging = false;
   List<StreamSubscription> _subscriptions = [];
 
-  final List<VideoChapter> _dummyChapters = [
-    VideoChapter('Grundlagen wissenschaftlicher Aussagen', const Duration(minutes: 1, seconds: 40), 'high'),
-    VideoChapter('Forschungslücke motivieren', const Duration(minutes: 4, seconds: 18), 'medium'),
-    VideoChapter('Primär- vs. Sekundärquellen', const Duration(minutes: 5, seconds: 20), 'high'),
-    VideoChapter('Direkte vs. indirekte Zitate', const Duration(minutes: 7, seconds: 32), 'low'),
-    VideoChapter('Aufbau einer Arbeit (Kap. 1-6)', const Duration(minutes: 9, seconds: 50), 'high'),
-    VideoChapter('Trennung von Rohdaten & Interpretation', const Duration(minutes: 15, seconds: 27), 'high'),
-    VideoChapter('Literaturrecherche & CRAAP-Test', const Duration(minutes: 30, seconds: 28), 'high'),
-  ];
+  // Analysis state
+  bool _isAnalyzing = false;
+  String _analysisProgress = '';
+  AnalysisResult? _analysisResult;
+
+  // Chat state
+  final List<Map<String, String>> _chatMessages = [];
+  final TextEditingController _chatController = TextEditingController();
+  bool _isChatLoading = false;
 
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 3, vsync: this);
+    _tabController = TabController(length: 4, vsync: this);
     
     _subscriptions.add(player.stream.duration.listen((duration) {
       if (mounted) setState(() => _videoDuration = duration);
@@ -51,6 +49,11 @@ class _AnalyzerScreenState extends State<AnalyzerScreen> with SingleTickerProvid
     _subscriptions.add(player.stream.position.listen((position) {
       if (mounted) setState(() => _currentPosition = position);
     }));
+
+    _chatMessages.add({
+      'role': 'model',
+      'text': 'Hallo! Lade ein Video und starte die KI-Analyse. Danach kannst du mir Fragen zum Inhalt stellen.',
+    });
   }
 
   @override
@@ -60,108 +63,218 @@ class _AnalyzerScreenState extends State<AnalyzerScreen> with SingleTickerProvid
     }
     player.dispose();
     _tabController.dispose();
+    _chatController.dispose();
     super.dispose();
   }
 
   Future<void> _pickVideo() async {
-    FilePickerResult? result = await FilePicker.platform.pickFiles(type: FileType.video);
+    FilePickerResult? result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['mp4', 'mkv', 'avi', 'mov', 'webm'],
+    );
     if (result != null && result.files.single.path != null) {
+      _loadVideo(result.files.single.path!, result.files.single.name);
+    }
+  }
+
+  void _loadVideo(String path, String name) {
+    setState(() {
+      _videoPath = path;
+      _videoName = name;
+      _analysisResult = null; // Reset analysis for new video
+    });
+    player.open(Media(path));
+  }
+
+  Future<void> _startAnalysis() async {
+    if (_videoPath == null) return;
+
+    if (!widget.settingsService.hasApiKey) {
+      _showSnackBar('Bitte erst den Gemini API Key in den Einstellungen hinterlegen!', isError: true);
+      return;
+    }
+
+    setState(() {
+      _isAnalyzing = true;
+      _analysisProgress = 'Video wird hochgeladen und analysiert...\nDies kann bei großen Videos einige Minuten dauern.';
+    });
+
+    try {
+      final gemini = GeminiService(widget.settingsService.geminiApiKey);
+      final result = await gemini.analyzeVideo(_videoPath!);
+
       setState(() {
-        _videoPath = result.files.single.path!;
-        _videoName = result.files.single.name;
-        // Mock a 1 hour duration if local file doesn't load length instantly for UI demo
-        _videoDuration = const Duration(hours: 1, minutes: 20); 
+        _analysisResult = result;
+        _isAnalyzing = false;
       });
-      player.open(Media(_videoPath!));
+      _tabController.animateTo(0); // Switch to analysis tab
+      _showSnackBar('Analyse erfolgreich abgeschlossen! ${result.chapters.length} Kapitel erkannt.');
+    } catch (e) {
+      setState(() {
+        _isAnalyzing = false;
+        _analysisProgress = '';
+      });
+      _showSnackBar('Fehler bei der Analyse: $e', isError: true);
     }
   }
 
   Future<void> _exportPdf() async {
-    if (_videoName == null) return;
+    if (_videoName == null || _analysisResult == null) {
+      _showSnackBar('Bitte erst ein Video laden und analysieren.', isError: true);
+      return;
+    }
+
     try {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Generiere PDF...')));
+      _showSnackBar('Generiere PDF...');
       final path = await PdfExportService.generateAndSavePdf(
         videoName: _videoName!,
-        summary: 'Das Video vermittelt fundamentale Grundlagen des wissenschaftlichen Arbeitens, der Literaturrecherche und des Aufbaus akademischer Arbeiten. Reproduzierbarkeit und Objektivität stehen im Vordergrund.',
-        timestamps: _dummyChapters.map((c) {
+        summary: _analysisResult!.summary,
+        timestamps: _analysisResult!.chapters.map((c) {
           final mins = c.time.inMinutes.toString().padLeft(2, '0');
           final secs = (c.time.inSeconds % 60).toString().padLeft(2, '0');
-          return {'time': '$mins:$secs', 'title': c.title};
+          return {'time': '$mins:$secs', 'title': '${c.title} [${c.priority.toUpperCase()}]'};
         }).toList(),
       );
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('PDF erfolgreich exportiert nach:\n$path'),
-          backgroundColor: Colors.green,
-          duration: const Duration(seconds: 5),
-        ));
-      }
+      _showSnackBar('PDF exportiert: $path');
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Fehler beim PDF Export: $e')));
-      }
+      _showSnackBar('PDF Export Fehler: $e', isError: true);
     }
+  }
+
+  Future<void> _sendChatMessage() async {
+    final msg = _chatController.text.trim();
+    if (msg.isEmpty) return;
+
+    if (!widget.settingsService.hasApiKey) {
+      _showSnackBar('Bitte erst den API Key hinterlegen!', isError: true);
+      return;
+    }
+
+    setState(() {
+      _chatMessages.add({'role': 'user', 'text': msg});
+      _chatController.clear();
+      _isChatLoading = true;
+    });
+
+    try {
+      final gemini = GeminiService(widget.settingsService.geminiApiKey);
+      // If we have an analysis, the chat method will use it as context
+      if (_analysisResult != null) {
+        // We need to pass the analysis context - the service stores it internally
+        // So we create a new service instance... let's improve this.
+        // For now, we pass the context through the message itself.
+      }
+      final reply = await gemini.chat(
+        _analysisResult != null
+            ? 'Analyse-Kontext:\n${_analysisResult!.summary}\n\nFrage: $msg'
+            : msg,
+      );
+      setState(() {
+        _chatMessages.add({'role': 'model', 'text': reply});
+      });
+    } catch (e) {
+      setState(() {
+        _chatMessages.add({'role': 'model', 'text': 'Fehler: $e'});
+      });
+    } finally {
+      setState(() => _isChatLoading = false);
+    }
+  }
+
+  void _showSnackBar(String message, {bool isError = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(message),
+      backgroundColor: isError ? Colors.red : const Color(0xFF55FC27),
+      duration: Duration(seconds: isError ? 5 : 3),
+    ));
   }
 
   @override
   Widget build(BuildContext context) {
     final bool isDesktop = MediaQuery.of(context).size.width >= 1024;
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        // Main Content (Video Player & Timeline)
-        Expanded(
-          flex: 5,
-          child: Container(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _buildHeader(),
-                const SizedBox(height: 24),
-                _buildVideoPlayer(),
-                const SizedBox(height: 16),
-                if (_videoPath != null) _buildInteractiveTimeline(),
-                const SizedBox(height: 24),
-                _buildQuickActions(),
-              ],
-            ),
-          ),
+    final bool isTablet = MediaQuery.of(context).size.width >= 600 && !isDesktop;
+
+    return DropTarget(
+      onDragDone: (detail) {
+        if (detail.files.isNotEmpty) {
+          final file = detail.files.first;
+          final ext = file.path.split('.').last.toLowerCase();
+          if (['mp4', 'mkv', 'avi', 'mov', 'webm'].contains(ext)) {
+            _loadVideo(file.path, file.name);
+          } else {
+            _showSnackBar('Nur Video-Dateien (.mp4, .mkv, .avi, .mov, .webm)', isError: true);
+          }
+        }
+      },
+      onDragEntered: (_) => setState(() => _isDragging = true),
+      onDragExited: (_) => setState(() => _isDragging = false),
+      child: Container(
+        decoration: BoxDecoration(
+          border: _isDragging ? Border.all(color: const Color(0xFF55FC27), width: 4) : null,
         ),
-        // Right Panel (Tabs)
-        if (isDesktop)
-          Expanded(
-            flex: 4,
-            child: Container(
-              color: Theme.of(context).colorScheme.surface,
-              child: Column(
-                children: [
-                  TabBar(
-                    controller: _tabController,
-                    indicatorColor: const Color(0xFF55FC27),
-                    labelColor: const Color(0xFF55FC27),
-                    unselectedLabelColor: Colors.white54,
-                    tabs: const [
-                      Tab(text: 'Analyse'),
-                      Tab(text: 'Lern-Tools'),
-                      Tab(text: 'Gamification'),
-                    ],
-                  ),
-                  Expanded(
-                    child: TabBarView(
-                      controller: _tabController,
-                      children: [
-                        _buildAnalysisTab(),
-                        _buildLearningToolsTab(),
-                        _buildGamificationTab(),
-                      ],
-                    ),
-                  ),
-                ],
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Main Content (Video Player & Timeline)
+            Expanded(
+              flex: 5,
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _buildHeader(),
+                    const SizedBox(height: 24),
+                    _buildVideoPlayer(),
+                    const SizedBox(height: 16),
+                    if (_videoPath != null && _analysisResult != null && _analysisResult!.chapters.isNotEmpty)
+                      _buildInteractiveTimeline(),
+                    const SizedBox(height: 24),
+                    _buildQuickActions(),
+                  ],
+                ),
               ),
             ),
-          ),
-      ],
+            // Right Panel (Tabs)
+            if (isDesktop || isTablet)
+              Expanded(
+                flex: 4,
+                child: Container(
+                  color: Theme.of(context).colorScheme.surface,
+                  child: Column(
+                    children: [
+                      TabBar(
+                        controller: _tabController,
+                        indicatorColor: const Color(0xFF55FC27),
+                        labelColor: const Color(0xFF55FC27),
+                        unselectedLabelColor: Colors.white54,
+                        isScrollable: true,
+                        tabs: const [
+                          Tab(text: 'Analyse'),
+                          Tab(text: 'KI Chat'),
+                          Tab(text: 'Lern-Tools'),
+                          Tab(text: 'Info'),
+                        ],
+                      ),
+                      Expanded(
+                        child: TabBarView(
+                          controller: _tabController,
+                          children: [
+                            _buildAnalysisTab(),
+                            _buildAIChatTab(),
+                            _buildLearningToolsTab(),
+                            _buildInfoTab(),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -177,7 +290,7 @@ class _AnalyzerScreenState extends State<AnalyzerScreen> with SingleTickerProvid
               style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1.5, color: Colors.white54),
             ),
             if (_videoName != null)
-               TextButton.icon(
+              TextButton.icon(
                 onPressed: _pickVideo,
                 icon: const Icon(Icons.loop, color: Color(0xFF55FC27), size: 16),
                 label: const Text('Neues Video', style: TextStyle(color: Color(0xFF55FC27))),
@@ -199,7 +312,7 @@ class _AnalyzerScreenState extends State<AnalyzerScreen> with SingleTickerProvid
             ),
             onPressed: _pickVideo,
             icon: const Icon(Icons.upload_file),
-            label: const Text('Video auswählen'),
+            label: const Text('Video auswählen oder hierher ziehen (Drag & Drop)'),
           ),
       ],
     );
@@ -212,10 +325,10 @@ class _AnalyzerScreenState extends State<AnalyzerScreen> with SingleTickerProvid
         decoration: BoxDecoration(
           color: Colors.black,
           borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: const Color(0xFF55FC27).withOpacity(0.3)),
+          border: Border.all(color: const Color(0xFF55FC27).withOpacity(_isDragging ? 1.0 : 0.3), width: _isDragging ? 3 : 1),
           boxShadow: [
             BoxShadow(color: Colors.black.withOpacity(0.5), blurRadius: 15, spreadRadius: 5)
-          ]
+          ],
         ),
         clipBehavior: Clip.antiAlias,
         child: _videoPath != null
@@ -233,7 +346,13 @@ class _AnalyzerScreenState extends State<AnalyzerScreen> with SingleTickerProvid
                       child: const Icon(Icons.play_arrow_rounded, size: 48, color: Color(0xFF55FC27)),
                     ),
                     const SizedBox(height: 16),
-                    const Text('Wähle ein Video zum Abspielen aus', style: TextStyle(color: Colors.white54)),
+                    Text(
+                      _isDragging ? '...lass das Video hier los!' : 'Wähle ein Video zum Abspielen aus',
+                      style: TextStyle(
+                        color: _isDragging ? const Color(0xFF55FC27) : Colors.white54,
+                        fontWeight: _isDragging ? FontWeight.bold : FontWeight.normal,
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -243,11 +362,15 @@ class _AnalyzerScreenState extends State<AnalyzerScreen> with SingleTickerProvid
 
   Widget _buildInteractiveTimeline() {
     if (_videoDuration.inSeconds == 0) return const SizedBox.shrink();
+    final chapters = _analysisResult!.chapters;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text('KAPITEL & THEMEN (Priorisiert nach Prüfungsrelevanz)', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white54)),
+        const Text(
+          'KAPITEL & THEMEN (Priorisiert nach Prüfungsrelevanz)',
+          style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white54),
+        ),
         const SizedBox(height: 12),
         LayoutBuilder(
           builder: (context, constraints) {
@@ -269,8 +392,8 @@ class _AnalyzerScreenState extends State<AnalyzerScreen> with SingleTickerProvid
                       borderRadius: BorderRadius.circular(12),
                     ),
                   ),
-                  // Chapters
-                  ..._dummyChapters.map((chapter) {
+                  // Chapter markers
+                  ...chapters.map((chapter) {
                     final double positionPercentage = chapter.time.inSeconds / _videoDuration.inSeconds;
                     final double leftPosition = (width * positionPercentage) - 6;
 
@@ -312,7 +435,7 @@ class _AnalyzerScreenState extends State<AnalyzerScreen> with SingleTickerProvid
                               shape: BoxShape.circle,
                               boxShadow: [
                                 BoxShadow(color: priorityColor.withOpacity(0.5), blurRadius: 4, spreadRadius: 1)
-                              ]
+                              ],
                             ),
                           ),
                         ),
@@ -324,6 +447,41 @@ class _AnalyzerScreenState extends State<AnalyzerScreen> with SingleTickerProvid
             );
           },
         ),
+        const SizedBox(height: 12),
+        // Chapter list below timeline
+        ...chapters.map((ch) {
+          final mins = ch.time.inMinutes.toString().padLeft(2, '0');
+          final secs = (ch.time.inSeconds % 60).toString().padLeft(2, '0');
+          Color dotColor;
+          if (ch.priority == 'high') {
+            dotColor = Colors.redAccent;
+          } else if (ch.priority == 'medium') {
+            dotColor = Colors.orangeAccent;
+          } else {
+            dotColor = Colors.greenAccent;
+          }
+          return InkWell(
+            onTap: () {
+              player.seek(ch.time);
+              player.play();
+            },
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Row(
+                children: [
+                  Container(
+                    width: 8, height: 8,
+                    decoration: BoxDecoration(color: dotColor, shape: BoxShape.circle),
+                  ),
+                  const SizedBox(width: 12),
+                  Text('$mins:$secs', style: const TextStyle(fontFamily: 'monospace', color: Color(0xFF55FC27), fontWeight: FontWeight.bold)),
+                  const SizedBox(width: 12),
+                  Expanded(child: Text(ch.title, style: const TextStyle(color: Colors.white70, fontSize: 13))),
+                ],
+              ),
+            ),
+          );
+        }).toList(),
       ],
     );
   }
@@ -334,50 +492,131 @@ class _AnalyzerScreenState extends State<AnalyzerScreen> with SingleTickerProvid
       runSpacing: 16,
       children: [
         if (_videoName != null)
-          _buildActionButton(Icons.summarize, 'KI Zusammenfassung aktualisieren', true, () {}),
-        if (_videoName != null)
-          _buildActionButton(Icons.picture_as_pdf, 'Als PDF exportieren', false, _exportPdf),
+          ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF55FC27),
+              foregroundColor: Colors.black,
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            ),
+            onPressed: _isAnalyzing ? null : _startAnalysis,
+            icon: _isAnalyzing
+                ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.black))
+                : const Icon(Icons.auto_awesome),
+            label: Text(
+              _isAnalyzing ? 'Analysiere...' : (_analysisResult != null ? 'Erneut analysieren' : 'KI ANALYSE STARTEN'),
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
+          ),
+        if (_analysisResult != null)
+          ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.transparent,
+              foregroundColor: Colors.white,
+              side: const BorderSide(color: Colors.white24),
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            ),
+            onPressed: _exportPdf,
+            icon: const Icon(Icons.picture_as_pdf),
+            label: const Text('Als PDF exportieren', style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
       ],
     );
   }
 
-  Widget _buildActionButton(IconData icon, String label, bool primary, VoidCallback onPressed) {
-    return ElevatedButton.icon(
-      style: ElevatedButton.styleFrom(
-        backgroundColor: primary ? const Color(0xFF55FC27) : Colors.transparent,
-        foregroundColor: primary ? Colors.black : Colors.white,
-        side: BorderSide(color: primary ? Colors.transparent : Colors.white24),
-        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-      ),
-      onPressed: onPressed,
-      icon: Icon(icon),
-      label: Text(label, style: const TextStyle(fontWeight: FontWeight.bold)),
-    );
-  }
+  // ─── TABS ─────────────────────────────────────────────────
 
   Widget _buildAnalysisTab() {
+    if (_isAnalyzing) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const CircularProgressIndicator(color: Color(0xFF55FC27)),
+            const SizedBox(height: 24),
+            Text(_analysisProgress, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white54)),
+          ],
+        ),
+      );
+    }
+
+    if (_analysisResult == null) {
+      return const Center(
+        child: Text(
+          'Lade ein Video und klicke auf "KI ANALYSE STARTEN"\num die Auswertung zu generieren.',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: Colors.white54),
+        ),
+      );
+    }
+
     return ListView(
       padding: const EdgeInsets.all(24),
       children: [
-        const Text('KERNZUSAMMENFASSUNG', style: TextStyle(color: Color(0xFF55FC27), fontWeight: FontWeight.bold, letterSpacing: 1.2)),
-        const SizedBox(height: 12),
-        const Text(
-          'Das Video vermittelt die fundamentalen Grundlagen des wissenschaftlichen Arbeitens, der Literaturrecherche und des Aufbaus akademischer Arbeiten.\n\n'
-          'Kernaussagen:\n'
-          '• Wissenschaftlichkeit erfordert Objektivität und Belege.\n'
-          '• "Standing on the shoulders of giants": Literaturrecherche ist essenziell.\n'
-          '• Reproduzierbarkeit als oberstes Gebot (Detaillierte Methodik).\n'
-          '• Primär- vor Sekundärquellen (Stille-Post-Prinzip vermeiden).',
-          style: TextStyle(height: 1.6, color: Colors.white70),
+        const Text('KI ANALYSE', style: TextStyle(color: Color(0xFF55FC27), fontWeight: FontWeight.bold, letterSpacing: 1.2)),
+        const SizedBox(height: 16),
+        SelectableText(
+          _analysisResult!.summary,
+          style: const TextStyle(height: 1.6, color: Colors.white70, fontSize: 14),
         ),
-        const SizedBox(height: 24),
-        const Text('RELEVANZ FÜR BAUINGENIEURWESEN', style: TextStyle(color: Color(0xFF55FC27), fontWeight: FontWeight.bold, letterSpacing: 1.2)),
-        const SizedBox(height: 12),
-        const Text(
-          '• Methodik: Reproduzierbarkeit ist im Bauwesen entscheidend (z.B. bei Druckfestigkeitsprüfungen).\n'
-          '• Quellen: Normen (DIN, Eurocode) statt Wikipedia.',
-          style: TextStyle(height: 1.6, color: Colors.white70),
+      ],
+    );
+  }
+
+  Widget _buildAIChatTab() {
+    return Column(
+      children: [
+        Expanded(
+          child: ListView.builder(
+            padding: const EdgeInsets.all(16),
+            itemCount: _chatMessages.length,
+            itemBuilder: (context, index) {
+              final msg = _chatMessages[index];
+              final isUser = msg['role'] == 'user';
+              return Align(
+                alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
+                child: Container(
+                  margin: const EdgeInsets.only(bottom: 12),
+                  padding: const EdgeInsets.all(14),
+                  constraints: const BoxConstraints(maxWidth: 350),
+                  decoration: BoxDecoration(
+                    color: isUser ? const Color(0xFF55FC27).withOpacity(0.15) : const Color(0xFF1E1E1E),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: isUser ? const Color(0xFF55FC27).withOpacity(0.5) : Colors.white12),
+                  ),
+                  child: SelectableText(
+                    msg['text']!,
+                    style: TextStyle(height: 1.5, color: isUser ? Colors.white : Colors.white70, fontSize: 13),
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+        if (_isChatLoading)
+          const Padding(
+            padding: EdgeInsets.all(8.0),
+            child: CircularProgressIndicator(color: Color(0xFF55FC27)),
+          ),
+        Container(
+          padding: const EdgeInsets.all(16.0),
+          decoration: const BoxDecoration(border: Border(top: BorderSide(color: Colors.white12))),
+          child: TextField(
+            controller: _chatController,
+            onSubmitted: (_) => _sendChatMessage(),
+            decoration: InputDecoration(
+              hintText: 'Frag die KI zum Video...',
+              hintStyle: const TextStyle(color: Colors.white38),
+              filled: true,
+              fillColor: Colors.black26,
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none),
+              suffixIcon: IconButton(
+                icon: const Icon(Icons.send, color: Color(0xFF55FC27)),
+                onPressed: _sendChatMessage,
+              ),
+            ),
+          ),
         ),
       ],
     );
@@ -387,46 +626,108 @@ class _AnalyzerScreenState extends State<AnalyzerScreen> with SingleTickerProvid
     return ListView(
       padding: const EdgeInsets.all(24),
       children: [
-        const Text('INTENSIVES LERNEN', style: TextStyle(color: Color(0xFF55FC27), fontWeight: FontWeight.bold, letterSpacing: 1.2)),
+        const Text('LERN-TOOLS', style: TextStyle(color: Color(0xFF55FC27), fontWeight: FontWeight.bold, letterSpacing: 1.2)),
         const SizedBox(height: 16),
-        _buildFeatureCard(Icons.quiz, 'Quiz Me!', 'Generiert interaktive Quizfragen zum aktuellen Kapitel.'),
-        _buildFeatureCard(Icons.library_books, 'Active Recall', 'Erzeugt einen Lückentext aus dem Transkript zum Ausfüllen.'),
-        _buildFeatureCard(Icons.flash_on, 'Flashcards Export', 'Erstelle automatische Anki-Karteikarten aus den wichtigsten Begriffen.'),
-        _buildFeatureCard(Icons.chat_bubble_outline, 'Grill Me (Mündliche Prüfung)', 'Der KI-Tutor testet dein Wissen im Dialog.'),
+        _buildFeatureCard(Icons.quiz, 'Quiz Me!', 'Generiert interaktive Quizfragen zum aktuellen Video.'),
+        _buildFeatureCard(Icons.library_books, 'Active Recall', 'Erzeugt einen Lückentext aus der Zusammenfassung.'),
+        _buildFeatureCard(Icons.flash_on, 'Flashcards Export', 'Erstelle automatische Anki-Karteikarten (CSV).'),
+        _buildFeatureCard(Icons.chat_bubble_outline, 'Grill Me (Mündl. Prüfung)', 'Der KI-Tutor testet dein Wissen im Dialog.'),
+        _buildFeatureCard(Icons.emoji_events, 'Gamification & Streaks', 'XP-System und Study-Streaks (Demnächst).'),
       ],
     );
   }
 
-  Widget _buildGamificationTab() {
+  Widget _buildInfoTab() {
     return ListView(
       padding: const EdgeInsets.all(24),
       children: [
-        const Text('DEIN FORTSCHRITT', style: TextStyle(color: Color(0xFF55FC27), fontWeight: FontWeight.bold, letterSpacing: 1.2)),
+        const Text('WIE FUNKTIONIERT DIESE APP?', style: TextStyle(color: Color(0xFF55FC27), fontWeight: FontWeight.bold, letterSpacing: 1.2)),
         const SizedBox(height: 16),
+        const Text(
+          'Diese App nutzt dasselbe Prinzip wie gemini.js (github.com/msveshnikov/allchat):\n',
+          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+        ),
         Container(
-          padding: const EdgeInsets.all(20),
+          padding: const EdgeInsets.all(16),
           decoration: BoxDecoration(
-            color: const Color(0xFF1E1E1E),
+            color: Colors.black26,
             borderRadius: BorderRadius.circular(12),
             border: Border.all(color: const Color(0xFF55FC27).withOpacity(0.3)),
           ),
-          child: Column(
+          child: const Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Icon(Icons.local_fire_department, color: Colors.orangeAccent, size: 48),
-              const SizedBox(height: 8),
-              const Text('3 Tage Study-Streak!', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white)),
-              const SizedBox(height: 8),
-              const Text('Bleib dran, um den nächsten Rang zu erreichen.', style: TextStyle(color: Colors.white54)),
-              const SizedBox(height: 16),
-              LinearProgressIndicator(value: 0.7, backgroundColor: Colors.white12, color: const Color(0xFF55FC27), borderRadius: BorderRadius.circular(4)),
-              const SizedBox(height: 8),
-              const Text('700 / 1000 XP', style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF55FC27))),
+              Text('1. VIDEO EINLESEN', style: TextStyle(color: Color(0xFF55FC27), fontWeight: FontWeight.bold)),
+              SizedBox(height: 4),
+              Text('Die Videodatei wird lokal von deiner Festplatte gelesen und in einen Base64-String umgewandelt (binäre Daten → Text).', style: TextStyle(color: Colors.white70, height: 1.5)),
+              SizedBox(height: 16),
+              Text('2. AN GEMINI API SENDEN', style: TextStyle(color: Color(0xFF55FC27), fontWeight: FontWeight.bold)),
+              SizedBox(height: 4),
+              Text('Der Base64-String wird zusammen mit einem Analyse-Prompt per HTTPS an die Google Gemini API gesendet. Bei großen Videos (>20MB) wird die File API verwendet, die das Video in Chunks hochlädt.', style: TextStyle(color: Colors.white70, height: 1.5)),
+              SizedBox(height: 16),
+              Text('3. MULTIMODALE KI-ANALYSE', style: TextStyle(color: Color(0xFF55FC27), fontWeight: FontWeight.bold)),
+              SizedBox(height: 4),
+              Text('Gemini 2.0 Flash analysiert das Video multimodal: Es \"sieht\" die Bilder/Folien UND \"hört\" den gesprochenen Text gleichzeitig. Das Modell erstellt daraus eine strukturierte Zusammenfassung mit Timecodes und Prüfungsrelevanz.', style: TextStyle(color: Colors.white70, height: 1.5)),
+              SizedBox(height: 16),
+              Text('4. ERGEBNIS PARSEN', style: TextStyle(color: Color(0xFF55FC27), fontWeight: FontWeight.bold)),
+              SizedBox(height: 4),
+              Text('Die App parst die Gemini-Antwort: Der Text wird als Zusammenfassung angezeigt, die JSON-Kapitel werden auf der Timeline als farbige Marker dargestellt (Rot = prüfungsrelevant, Gelb = wichtig, Grün = Kontext).', style: TextStyle(color: Colors.white70, height: 1.5)),
             ],
           ),
         ),
         const SizedBox(height: 16),
-        _buildFeatureCard(Icons.emoji_events, 'Errungenschaften', 'Schalte Badges für intensive Lern-Sessions frei.'),
-        _buildFeatureCard(Icons.groups, 'Leaderboard', 'Vergleiche dich mit deinen Kommilitonen.'),
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: Colors.black26,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: Colors.white12),
+          ),
+          child: const Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('// gemini.js – Original-Code (vereinfacht)', style: TextStyle(color: Colors.white38, fontFamily: 'monospace', fontSize: 11)),
+              SizedBox(height: 8),
+              SelectableText(
+                'async function getTextGemini(prompt, imageBase64, fileType) {\n'
+                '  const parts = [];\n'
+                '  if (fileType === "mp4") {\n'
+                '    parts.push({\n'
+                '      inlineData: {\n'
+                '        mimeType: "video/mp4",\n'
+                '        data: imageBase64,  // ← Base64-Video\n'
+                '      },\n'
+                '    });\n'
+                '  }\n'
+                '  parts.push({ text: prompt });\n'
+                '  const result = await model.generateContent({\n'
+                '    contents: [{ parts }],\n'
+                '  });\n'
+                '  return result.response.text();\n'
+                '}',
+                style: TextStyle(color: Color(0xFF55FC27), fontFamily: 'monospace', fontSize: 12, height: 1.4),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 32),
+        const Text('IMPRESSUM', style: TextStyle(color: Color(0xFF55FC27), fontWeight: FontWeight.bold, letterSpacing: 1.2)),
+        const SizedBox(height: 16),
+        const Text(
+          'KIO Video Analyzer\n'
+          'Ein KI-gestütztes Videoanalyse-Tool für Studierende\n\n'
+          'Entwickelt von / für:\n'
+          'KREATIV INSTITUT.OWL\n\n'
+          'Technologie:\n'
+          '• Flutter (Desktop & Mobile)\n'
+          '• Google Gemini 2.0 Flash API\n'
+          '• MediaKit Video Player\n'
+          '• Basierend auf dem gemini.js-Pattern von AllChat\n'
+          '  (github.com/msveshnikov/allchat)\n\n'
+          'Kontakt:\n'
+          'kreativ.institute',
+          style: TextStyle(color: Colors.white70, height: 1.6),
+        ),
       ],
     );
   }
@@ -454,10 +755,7 @@ class _AnalyzerScreenState extends State<AnalyzerScreen> with SingleTickerProvid
               ],
             ),
           ),
-          IconButton(
-            icon: const Icon(Icons.arrow_forward_ios, color: Colors.white38, size: 16),
-            onPressed: () {},
-          )
+          const Icon(Icons.arrow_forward_ios, color: Colors.white38, size: 16),
         ],
       ),
     );

@@ -2,15 +2,21 @@ import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart';
 import 'widgets/kio_sidebar.dart';
 import 'screens/analyzer_screen.dart';
+import 'services/settings_service.dart';
 
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   MediaKit.ensureInitialized();
-  runApp(const KioVideoAnalyzerApp());
+
+  final settingsService = SettingsService();
+  await settingsService.init();
+
+  runApp(KioVideoAnalyzerApp(settingsService: settingsService));
 }
 
 class KioVideoAnalyzerApp extends StatelessWidget {
-  const KioVideoAnalyzerApp({super.key});
+  final SettingsService settingsService;
+  const KioVideoAnalyzerApp({super.key, required this.settingsService});
 
   @override
   Widget build(BuildContext context) {
@@ -19,7 +25,7 @@ class KioVideoAnalyzerApp extends StatelessWidget {
     const surfaceColor = Color(0xFF1E1E1E);
 
     return MaterialApp(
-      title: 'KIO Video Analyzer UI',
+      title: 'KIO Video Analyzer',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         brightness: Brightness.dark,
@@ -37,13 +43,14 @@ class KioVideoAnalyzerApp extends StatelessWidget {
         ),
         useMaterial3: true,
       ),
-      home: const MainLayout(),
+      home: MainLayout(settingsService: settingsService),
     );
   }
 }
 
 class MainLayout extends StatefulWidget {
-  const MainLayout({super.key});
+  final SettingsService settingsService;
+  const MainLayout({super.key, required this.settingsService});
 
   @override
   State<MainLayout> createState() => _MainLayoutState();
@@ -51,8 +58,22 @@ class MainLayout extends StatefulWidget {
 
 class _MainLayoutState extends State<MainLayout> {
   int _selectedIndex = 0;
+  final TextEditingController _apiKeyController = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    _apiKeyController.text = widget.settingsService.geminiApiKey;
+  }
+
+  @override
+  void dispose() {
+    _apiKeyController.dispose();
+    super.dispose();
+  }
 
   void _showSettingsDialog() {
+    _apiKeyController.text = widget.settingsService.geminiApiKey;
     showDialog(
       context: context,
       builder: (context) {
@@ -66,6 +87,7 @@ class _MainLayoutState extends State<MainLayout> {
               const Text('Google Gemini API Key', style: TextStyle(color: Colors.white70)),
               const SizedBox(height: 8),
               TextField(
+                controller: _apiKeyController,
                 obscureText: true,
                 decoration: InputDecoration(
                   hintText: 'AIzaSy...',
@@ -82,7 +104,10 @@ class _MainLayoutState extends State<MainLayout> {
                 ),
               ),
               const SizedBox(height: 16),
-              const Text('Dieser Key wird später für die echte KI-Analyse benötigt.', style: TextStyle(fontSize: 12, color: Colors.white38)),
+              const Text(
+                'Hole dir einen kostenlosen Key unter:\nhttps://aistudio.google.com/app/apikey',
+                style: TextStyle(fontSize: 12, color: Colors.white38),
+              ),
             ],
           ),
           actions: [
@@ -95,7 +120,18 @@ class _MainLayoutState extends State<MainLayout> {
                 backgroundColor: const Color(0xFF55FC27),
                 foregroundColor: Colors.black,
               ),
-              onPressed: () => Navigator.pop(context),
+              onPressed: () async {
+                await widget.settingsService.setGeminiApiKey(_apiKeyController.text.trim());
+                if (mounted) {
+                  Navigator.pop(context);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('API Key gespeichert!'),
+                      backgroundColor: Color(0xFF55FC27),
+                    ),
+                  );
+                }
+              },
               child: const Text('Speichern', style: TextStyle(fontWeight: FontWeight.bold)),
             ),
           ],
@@ -147,14 +183,15 @@ class _MainLayoutState extends State<MainLayout> {
   Widget _buildMainContent() {
     switch (_selectedIndex) {
       case 0:
-      case 3:
-        return const AnalyzerScreen();
+        return AnalyzerScreen(settingsService: widget.settingsService);
       case 1:
         return const Center(child: Text('Video-Upload (Demnächst verfügbar)', style: TextStyle(color: Colors.white54)));
       case 2:
         return const Center(child: Text('Video-Aufnahme (Demnächst verfügbar)', style: TextStyle(color: Colors.white54)));
+      case 3:
+        return AnalyzerScreen(settingsService: widget.settingsService);
       default:
-        return const AnalyzerScreen();
+        return AnalyzerScreen(settingsService: widget.settingsService);
     }
   }
 }
