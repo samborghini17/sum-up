@@ -1,0 +1,20 @@
+# Large video files - keep local only
+*.mp4
+
+# Flutter build artifacts
+kio_video_ui/build/
+kio_video_ui/.dart_tool/
+kio_video_ui/.idea/
+kio_video_ui/.metadata
+kio_video_ui/.flutter-plugins-dependencies
+kio_video_ui/android/.gradle/
+kio_video_ui/android/local.properties
+kio_video_ui/android/app/src/main/java/io/flutter/plugins/
+kio_video_ui/ios/Flutter/Generated.xcconfig
+kio_video_ui/ios/Flutter/ephemeral/
+kio_video_ui/ios/Flutter/flutter_export_environment.sh
+kio_video_ui/ios/Runner/GeneratedPluginRegistrant.*
+kio_video_ui/macos/Flutter/ephemeral/
+kio_video_ui/linux/flutter/ephemeral/
+kio_video_ui/windows/flutter/ephemeral/
+kio_video_ui/*.iml
